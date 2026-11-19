@@ -1,0 +1,188 @@
+
+# Analytical & Forensic Engineering Responses
+
+## Question 1 — Memory Coalescing & Strided Column Packing
+
+The local CUDA arrays use row-major (C-contiguous) storage. Therefore, consecutive columns in the same row are stored next to each other in memory, while consecutive elements in a column are separated by the row stride.
+
+Each local subdomain has dimensions 258 × 258, including ghost cells. Since each element is a float64 value, the distance between consecutive rows is:
+
+258 × 8 = 2,064 bytes.
+
+The left and right halo columns contain 256 owned values each. Their elements are separated by 2,064 bytes, so they are not contiguous in memory. A single ordinary contiguous DMA transfer cannot directly copy only these column elements without also transferring the values between them.
+
+The GPU `pack_halos_kernel` solves this problem by gathering the strided column elements into contiguous one-dimensional device buffers. These packed buffers can then be transferred asynchronously to pinned host memory.
+
+For one column, the useful transfer size is:
+
+256 × 8 = 2,048 bytes.
+
+If a separate 256 × 256 bounding-box copy were used for each column, the transfer would be:
+
+256 × 256 × 8 = 524,288 bytes.
+
+The extra transfer per column would be:
+
+524,288 − 2,048 = 522,240 bytes.
+
+For both left and right columns, this would produce:
+
+2 × 522,240 = 1,044,480 extra bytes per rank per halo exchange.
+
+Therefore, packing the columns on the GPU avoids transferring a large amount of unnecessary data over PCIe. It also provides contiguous buffers for the MPI communication stage.
+
+## Question 2 — Shared-Memory Tile Indexing & Bank Conflict Analysis
+
+The stencil kernel uses a 16 × 16 thread block and an 18 × 18 shared-memory tile. The extra row and column on every side provide the one-cell halo apron.
+
+The shared-memory indices are calculated as:
+
+- `sx = tx + 1`
+- `sy = ty + 1`
+
+For thread (tx=0, ty=0):
+
+- Center: `smem[1,1]`
+- North: `smem[0,1]`
+- South: `smem[2,1]`
+- West: `smem[1,0]`
+- East: `smem[1,2]`
+
+This thread also loads the top and left apron values.
+
+For thread (tx=15, ty=15):
+
+- Center: `smem[16,16]`
+- North: `smem[15,16]`
+- South: `smem[17,16]`
+- West: `smem[16,15]`
+- East: `smem[16,17]`
+
+This thread loads the bottom and right apron values.
+
+The NVIDIA Tesla T4 has compute capability 7.5 and 32 shared-memory banks, each with a 4-byte bank width. A float64 value occupies 8 bytes, or two 4-byte banks.
+
+For consecutive float64 values along a row, the address advances by 8 bytes. The 64-bit accesses are serviced in separate shared-memory transactions, allowing consecutive row accesses to use distinct bank pairs without the same kind of repeated-stride conflict.
+
+For column accesses, the stride is 18 float64 elements:
+
+18 × 8 = 144 bytes = 36 four-byte bank words.
+
+The bank position therefore advances by 36 modulo 32, which is equivalent to advancing by 4 banks. This repeats the bank pattern and can produce a 2-way bank conflict within a 16-thread transaction.
+
+Thus, the 18-element row stride is important when analyzing column accesses. The exact conflict behavior depends on the transaction and warp access pattern, not only on the size of the data type.
+
+## Question 3 — PTX Assembly Audit & Warp Synchronization
+
+The PTX assembly inspection of `tiled_stencil_kernel.inspect_asm()` produced the following counts:
+
+| PTX instruction | Count |
+|---|---:|
+| `st.shared.f64` | 5 |
+| `ld.shared.f64` | 5 |
+| `bar.sync` | 1 |
+
+All three instruction types were present, so the PTX audit passed.
+
+The 16 × 16 thread block contains 256 threads. Since a warp contains 32 threads, each block contains:
+
+256 / 32 = 8 warps.
+
+The kernel first loads the center cells and halo apron into shared memory. It then calls `cuda.syncthreads()` before performing stencil calculations.
+
+Without this barrier, one warp could start reading neighboring shared-memory values before another warp has finished writing its center or apron values. This creates a read-after-write data hazard and may cause the stencil to use uninitialized or stale shared-memory values.
+
+The barrier ensures that all threads in the block finish their shared-memory loading operations before any thread proceeds to the stencil calculations.
+
+The PTX counts represent emitted instruction statements in the inspected assembly, not the total number of dynamic executions across all threads and time steps.
+
+## Question 4 — Multi-Process Context Sharing on a Single Physical GPU
+
+The experiment launched four independent MPI processes, each selecting CUDA device 0. All four processes therefore shared one physical NVIDIA Tesla T4 GPU rather than using four separate GPUs.
+
+Each process has its own CUDA context. The GPU driver schedules work from these contexts onto the available streaming multiprocessors (SMs). The contexts also share physical GPU resources, including execution capacity, memory bandwidth, and DMA engines.
+
+The measured benchmark results were:
+
+| Execution mode | Wall-clock time |
+|---|---:|
+| Serialized | 8,579.875 ms |
+| Overlapped | 5,387.814 ms |
+
+The speedup was:
+
+8,579.875 / 5,387.814 = 1.59246×
+
+The reduction in execution time was approximately 37.20%.
+
+The overlapped implementation improved performance because it performed deep-interior stencil computation while MPI halo communication was in progress. This reduced the amount of time spent waiting for communication before computation could continue.
+
+However, the gain is limited by the fact that all four processes share one GPU. Their kernels and memory transfers compete for the same physical resources. This differs from a four-GPU system connected through InfiniBand, where each MPI rank can use a dedicated GPU and communication can occur between separate devices.
+
+Therefore, the measured improvement demonstrates useful communication-computation overlap on the shared T4, but it should not be interpreted as the performance expected from four dedicated GPUs.
+
+## Question 5 — Point-to-Point Message Deadlock & MPI.PROC_NULL Semantics
+
+Replacing non-blocking `Isend` and `Irecv` operations with blocking `Send` followed by blocking `Recv` in a fixed directional order can create a circular wait.
+
+For small messages, an MPI implementation may use an eager protocol. The sender can copy the message into an internal buffer and return before the receiver has posted its matching receive.
+
+For large messages, the implementation may use a rendezvous protocol. In this case, the sender may wait for the receiver to participate in the transfer before the send can complete.
+
+If all ranks execute blocking sends in the same direction before posting their receives, neighboring ranks can wait for one another indefinitely. Each process is waiting for a receive that cannot be posted because that process is itself blocked in a send.
+
+This creates a deadlock. The exact eager-to-rendezvous threshold depends on the MPI implementation and its configuration.
+
+`MPI.PROC_NULL` simplifies communication at physical boundaries. For example, rank (0,0) has no upper or left neighbor. It can still issue communication operations using `MPI.PROC_NULL` instead of adding separate special cases for those directions.
+
+Communication with `MPI.PROC_NULL` completes without transferring a message. A receive from it does not overwrite the receive buffer. Physical boundary conditions must still be maintained correctly; in this assignment, the outer boundary values are zero.
+
+## Question 6 — Explicit CFL Stability & Energy Conservation Proof
+
+The simulation uses the explicit diffusion stability condition:
+
+Δt_max = Δx² / (4 × κ_max)
+
+The measured maximum diffusivity was:
+
+κ_max = 0.2003008277993342
+
+The grid spacing was:
+
+Δx = Δy = 1 / 513 = 0.001949317738791423
+
+Substituting the measured values gives:
+
+Δt_max = 4.7426659296856095 × 10⁻⁶
+
+The simulation used:
+
+Δt = 4.268399336717049 × 10⁻⁶
+
+The ratio is:
+
+Δt / Δt_max = 0.9
+
+Therefore, the selected timestep is 90% of the calculated stability limit and is below the specified explicit diffusion limit.
+
+The global energy values obtained through MPI Allreduce were:
+
+| Step | Serialized energy | Overlapped energy |
+|---:|---:|---:|
+| 0 | 0.1002549324 | 0.1002549324 |
+| 100 | 0.1002238734 | 0.1002238734 |
+| 200 | 0.1002046373 | 0.1002046373 |
+| 300 | 0.1001871105 | 0.1001871105 |
+| 400 | 0.1001701469 | 0.1001701469 |
+
+The energy decreased at every recorded checkpoint. This is consistent with dissipative behavior in the measured simulation.
+
+The residual norms also decreased from 0.01146743 at step 100 to 0.01055168 at step 400.
+
+Finally, the maximum absolute difference between the serialized and overlapped final states was:
+
+0.0
+
+This is below the required tolerance of 10⁻¹². Both execution modes therefore produced identical numerical results in this run.
+
+The energy trace is an empirical result for this particular initialized problem. Because the PDE includes a source term, monotonic energy decrease is not a universal guarantee for every possible source configuration.
